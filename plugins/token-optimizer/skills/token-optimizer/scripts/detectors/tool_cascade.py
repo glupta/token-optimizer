@@ -56,7 +56,7 @@ def detect_tool_cascade(session_data):
                 f"A cascade of {streak_len} tool errors burned ~{est_tokens:,} tokens. "
                 "Break error chains early: diagnose the root cause after 2 failures."
             ),
-            "occurrence_count": len(streaks),
+            "occurrence_count": streak_len,
         })
 
     return findings
