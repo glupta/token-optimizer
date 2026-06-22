@@ -52,7 +52,8 @@ CREATE TABLE IF NOT EXISTS file_reads (
     last_replacement_type TEXT DEFAULT '',
     repeat_replacement_count INTEGER DEFAULT 0,
     last_structure_reason TEXT DEFAULT '',
-    last_structure_confidence REAL DEFAULT 0.0
+    last_structure_confidence REAL DEFAULT 0.0,
+    consecutive_denials INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS tool_outputs (
@@ -150,6 +151,16 @@ class SessionStore:
         if conn is None:
             return
         conn.executescript(_SCHEMA_SQL)
+        # Migrate pre-existing DBs that lack the consecutive_denials column.
+        # CREATE TABLE above already adds it for new DBs; existing ones need ALTER.
+        try:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(file_reads)")}
+            if "consecutive_denials" not in cols:
+                conn.execute(
+                    "ALTER TABLE file_reads ADD COLUMN consecutive_denials INTEGER DEFAULT 0"
+                )
+        except Exception:
+            pass
         conn.execute(
             "INSERT OR IGNORE INTO session_meta (key, value) VALUES (?, ?)",
             ("_schema_version", str(_SCHEMA_VERSION)),
@@ -203,8 +214,8 @@ class SessionStore:
                 read_count, content_hash, last_access,
                 last_replacement_fingerprint, last_replacement_type,
                 repeat_replacement_count, last_structure_reason,
-                last_structure_confidence)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                last_structure_confidence, consecutive_denials)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(file_path) DO UPDATE SET
                  mtime_ns=excluded.mtime_ns,
                  size_bytes=excluded.size_bytes,
@@ -217,7 +228,8 @@ class SessionStore:
                  last_replacement_type=excluded.last_replacement_type,
                  repeat_replacement_count=excluded.repeat_replacement_count,
                  last_structure_reason=excluded.last_structure_reason,
-                 last_structure_confidence=excluded.last_structure_confidence
+                 last_structure_confidence=excluded.last_structure_confidence,
+                 consecutive_denials=excluded.consecutive_denials
             """,
             (
                 file_path,
@@ -233,6 +245,7 @@ class SessionStore:
                 int(entry.get("repeat_replacement_count", 0)),
                 entry.get("last_structure_reason", ""),
                 float(entry.get("last_structure_confidence", 0.0)),
+                int(entry.get("consecutive_denials", 0)),
             ),
         )
         conn.commit()
