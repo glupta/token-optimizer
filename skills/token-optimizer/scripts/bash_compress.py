@@ -1102,7 +1102,7 @@ def _compress_csv(output):
         if total < _CSV_MIN_LINES - 1:
             return output
         preview = data_rows[:_CSV_PREVIEW_ROWS]
-        lines_out = [delimiter.join(header)]
+        lines_out = [delimiter.join(cols)]
         for row in preview:
             row = row[:_CSV_MAX_COLS]
             lines_out.append(delimiter.join(
