@@ -152,7 +152,7 @@ def check_staleness(filepath, section, max_age_hours=DEFAULT_MAX_AGE_HOURS):
         return {"stale": True, "age_hours": None, "exists": True}
 
     try:
-        block_time = datetime.fromisoformat(ts_match.group(1))
+        block_time = datetime.strptime(ts_match.group(1), "%Y-%m-%dT%H:%M")
         age_hours = (datetime.now() - block_time).total_seconds() / 3600
         return {
             "stale": age_hours > max_age_hours,
