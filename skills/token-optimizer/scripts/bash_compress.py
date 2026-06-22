@@ -291,7 +291,7 @@ def _compress_git_diff(output):
     # Keep first 30 lines of actual diff content
     result_lines = lines[:30]
     if len(lines) > 30:
-        result_lines.append(f"\n... ({len(lines) - 30} more lines, +{additions}/-{deletions} total)")
+        result_lines.append(f"... ({len(lines) - 30} more lines, +{additions}/-{deletions} total)")
 
     return "\n".join(result_lines)
 
