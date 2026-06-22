@@ -3,6 +3,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 
@@ -230,7 +231,7 @@ class CacheTtlMixTests(unittest.TestCase):
                    (jsonl_path, date, project, cache_hit_rate, cache_create_1h_tokens,
                     cache_create_5m_tokens, cache_ttl_scanned)
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (str(session_path), "2026-04-04", "home", 0.0, 0, 0, 0),
+                (str(session_path), datetime.now().strftime("%Y-%m-%d"), "home", 0.0, 0, 0, 0),
             )
             conn.commit()
 
