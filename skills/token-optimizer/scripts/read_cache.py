@@ -1720,7 +1720,12 @@ def handle_stats(session_id: str) -> None:
     """Print cache stats for a session."""
 
     store = _make_store(session_id)
-    files = store.get_all_file_entries()
+    if store is None:
+        return
+    try:
+        files = store.get_all_file_entries()
+    finally:
+        store.close()
     total_reads = sum(int(entry.get("read_count", 0) or 0) for entry in files.values())
     total_tokens = sum(int(entry.get("tokens_est", 0) or 0) for entry in files.values())
 
