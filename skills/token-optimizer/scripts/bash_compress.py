@@ -1500,7 +1500,7 @@ def compress(command_str, raw_output, returncode=0, stderr=""):
         compressed_line_set = set(compressed.splitlines())
         appended: list[str] = []
         injected = 0
-        for line_idx in preserved_lines:
+        for line_idx in sorted(preserved_lines):
             if injected >= _MAX_REINJECTED_LINES:
                 break
             if line_idx < len(original_lines):
