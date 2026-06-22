@@ -1510,9 +1510,17 @@ def compress(command_str, raw_output, returncode=0, stderr=""):
                     compressed_line_set.add(preserved_line)
                     injected += 1
         if appended:
-            if injected < len(preserved_lines):
+            # Count lines that are genuinely absent from the compressed output
+            # and were not re-injected (hit the cap). Lines already present in
+            # compressed_line_set are already visible and must not be counted
+            # as "archived" — their count would be misleading.
+            remaining = sum(
+                1 for idx in preserved_lines
+                if idx < len(original_lines) and original_lines[idx] not in compressed_line_set
+            )
+            if remaining > 0:
                 appended.append(
-                    f"... {len(preserved_lines) - injected} more credential-bearing lines "
+                    f"... {remaining} more credential-bearing lines "
                     f"archived in full original (retrieve via expand key) ..."
                 )
             compressed = compressed + "\n" + "\n".join(appended)
