@@ -15,8 +15,15 @@ def _write_atomic(filepath, content):
     """Atomic write via tmp + rename."""
     filepath = Path(filepath)
     tmp = filepath.with_suffix(f".{os.getpid()}.tmp")
-    tmp.write_text(content, encoding="utf-8")
-    os.replace(tmp, filepath)
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        os.replace(tmp, filepath)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 # Marker format: <!-- TOKEN_OPTIMIZER:SECTION_NAME --> ... <!-- /TOKEN_OPTIMIZER:SECTION_NAME -->
