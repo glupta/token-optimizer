@@ -160,7 +160,10 @@ class CodexTokenContractTests(unittest.TestCase):
                 {
                     "timestamp": "2026-08-08T12:00:00Z",
                     "type": "session_meta",
-                    "payload": {"id": "session-immutable-123456"},
+                    "payload": {
+                        "id": "session-immutable-123456",
+                        "thread_source": "subagent",
+                    },
                 },
                 {
                     "timestamp": "2026-08-08T13:00:00Z",
@@ -174,6 +177,7 @@ class CodexTokenContractTests(unittest.TestCase):
 
             self.assertEqual(identity["session_id"], "session-immutable-123456")
             self.assertEqual(identity["started_at"], 1786190400.0)
+            self.assertEqual(identity["thread_source"], "subagent")
 
     def test_session_start_injects_contract_for_every_source(self):
         for source in ("startup", "resume", "clear", "compact"):
@@ -244,6 +248,15 @@ class CodexTokenContractTests(unittest.TestCase):
 
 
 class CodexTokenContractDoctorTests(unittest.TestCase):
+    def setUp(self):
+        self._clear_current_thread = patch.dict(
+            os.environ, {"CODEX_THREAD_ID": ""}
+        )
+        self._clear_current_thread.start()
+
+    def tearDown(self):
+        self._clear_current_thread.stop()
+
     def _install_state(self):
         return {
             "contract_version": codex_token_contract.CONTRACT_VERSION,
@@ -301,6 +314,135 @@ class CodexTokenContractDoctorTests(unittest.TestCase):
         ), patch.object(codex_token_contract, "load_receipt", return_value=receipt):
             check = codex_doctor._token_contract_runtime_check()
         self.assertEqual(check["status"], "OK")
+
+    def test_newer_subagent_without_host_receipt_does_not_displace_root_session(self):
+        boundary = 1000 + codex_doctor.HOST_SESSION_START_GRACE_SECONDS
+        root_session_id = "session-root"
+        receipt = {
+            "session_id": root_session_id,
+            "contract_version": codex_token_contract.CONTRACT_VERSION,
+            "contract_sha256": codex_token_contract.CONTRACT_SHA256,
+            "simulated": False,
+        }
+        identities = {
+            Path("subagent.jsonl"): {
+                "session_id": "session-subagent",
+                "started_at": boundary + 2,
+                "path": "subagent.jsonl",
+                "thread_source": "subagent",
+            },
+            Path("root.jsonl"): {
+                "session_id": root_session_id,
+                "started_at": boundary + 1,
+                "path": "root.jsonl",
+                "thread_source": None,
+            },
+        }
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            codex_token_contract, "load_install_state", side_effect=self._install_state
+        ), patch.object(
+            codex_token_contract, "iter_receipts", return_value=iter([])
+        ), patch.object(
+            codex_session,
+            "find_all_jsonl_files",
+            return_value=[
+                (Path("subagent.jsonl"), 0, "test"),
+                (Path("root.jsonl"), 0, "test"),
+            ],
+        ), patch.object(
+            codex_session,
+            "session_identity",
+            side_effect=lambda path: identities[path],
+        ), patch.object(
+            codex_token_contract, "load_receipt", return_value=receipt
+        ) as load_receipt:
+            check = codex_doctor._token_contract_runtime_check()
+
+        self.assertEqual(check["status"], "OK")
+        load_receipt.assert_called_once_with(root_session_id)
+
+    def test_current_thread_precedes_newer_unrelated_top_level_session(self):
+        current_session_id = "session-current"
+        receipt = {
+            "session_id": current_session_id,
+            "contract_version": codex_token_contract.CONTRACT_VERSION,
+            "contract_sha256": codex_token_contract.CONTRACT_SHA256,
+            # Reinstalling the identical version/hash may advance install state;
+            # the content-bound receipt remains valid for the current session.
+            "last_seen_at": "1970-01-01T00:16:39+00:00",
+            "simulated": False,
+        }
+        with patch.dict(
+            os.environ, {"CODEX_THREAD_ID": current_session_id}
+        ), patch.object(
+            codex_token_contract, "load_install_state", side_effect=self._install_state
+        ), patch.object(
+            codex_token_contract, "load_receipt", return_value=receipt
+        ) as load_receipt, patch.object(
+            codex_session, "find_all_jsonl_files"
+        ) as find_sessions:
+            check = codex_doctor._token_contract_runtime_check()
+
+        self.assertEqual(check["status"], "OK")
+        load_receipt.assert_called_once_with(current_session_id)
+        find_sessions.assert_not_called()
+
+    def test_current_thread_receipt_validation_fails_closed(self):
+        current_session_id = "session-current"
+        cases = {
+            "missing": {},
+            "simulated": {
+                "session_id": current_session_id,
+                "contract_version": codex_token_contract.CONTRACT_VERSION,
+                "contract_sha256": codex_token_contract.CONTRACT_SHA256,
+                "simulated": True,
+            },
+            "mismatch": {
+                "session_id": current_session_id,
+                "contract_version": codex_token_contract.CONTRACT_VERSION,
+                "contract_sha256": "wrong",
+                "simulated": False,
+            },
+        }
+        for name, receipt in cases.items():
+            with self.subTest(name=name), patch.dict(
+                os.environ, {"CODEX_THREAD_ID": current_session_id}
+            ), patch.object(
+                codex_token_contract, "load_install_state", side_effect=self._install_state
+            ), patch.object(
+                codex_token_contract, "load_receipt", return_value=receipt
+            ), patch.object(
+                codex_session, "find_all_jsonl_files"
+            ) as find_sessions:
+                check = codex_doctor._token_contract_runtime_check()
+
+            self.assertEqual(check["status"], "FAIL")
+            find_sessions.assert_not_called()
+
+    def test_only_post_install_subagents_fail_closed_without_current_thread(self):
+        boundary = 1000 + codex_doctor.HOST_SESSION_START_GRACE_SECONDS
+        with patch.object(
+            codex_token_contract, "load_install_state", side_effect=self._install_state
+        ), patch.object(
+            codex_token_contract, "iter_receipts", return_value=iter([])
+        ), patch.object(
+            codex_session,
+            "find_all_jsonl_files",
+            return_value=[(Path("subagent.jsonl"), 0, "test")],
+        ), patch.object(
+            codex_session,
+            "session_identity",
+            return_value={
+                "session_id": "session-subagent",
+                "started_at": boundary + 1,
+                "path": "subagent.jsonl",
+                "thread_source": "subagent",
+            },
+        ):
+            check = codex_doctor._token_contract_runtime_check()
+
+        self.assertEqual(check["status"], "FAIL")
+        self.assertIn("only unhooked subagent", check["detail"])
 
     def test_post_install_active_chat_refresh_passes_without_new_session(self):
         receipt = {

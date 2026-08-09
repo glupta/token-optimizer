@@ -274,6 +274,7 @@ def session_identity(path: Path, max_records: int = 256) -> dict[str, Any] | Non
     """Return immutable session id/start time without parsing the full transcript."""
     first_ts: datetime | None = None
     session_id: str | None = None
+    thread_source: str | None = None
     for index, record in enumerate(_iter_json_records(path, skip_large_file=False)):
         if index >= max_records:
             break
@@ -284,6 +285,13 @@ def session_identity(path: Path, max_records: int = 256) -> dict[str, Any] | Non
         if record.get("type") == "session_meta":
             value = payload.get("id")
             session_id = _safe_session_id(str(value)) if value else None
+            raw_thread_source = payload.get("thread_source")
+            if isinstance(raw_thread_source, str) and raw_thread_source.strip():
+                thread_source = raw_thread_source.strip().lower()
+            elif isinstance(payload.get("source"), dict) and isinstance(
+                payload["source"].get("subagent"), dict
+            ):
+                thread_source = "subagent"
             session_ts = _parse_ts(record.get("timestamp") or payload.get("timestamp"))
             first_ts = session_ts or first_ts
             break
@@ -293,6 +301,7 @@ def session_identity(path: Path, max_records: int = 256) -> dict[str, Any] | Non
         "session_id": session_id,
         "started_at": first_ts.timestamp(),
         "path": str(path),
+        "thread_source": thread_source,
     }
 
 

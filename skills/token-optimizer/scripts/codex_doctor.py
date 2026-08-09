@@ -296,6 +296,33 @@ def _token_contract_runtime_check() -> dict[str, str]:
         )
 
     boundary = installed_at + HOST_SESSION_START_GRACE_SECONDS
+    # CODEX_THREAD_ID is trusted host metadata. If a host deliberately shares
+    # it with a child context, the exact version/hash-bound receipt represents
+    # that same delivered contract context rather than user-controlled input.
+    current_session_id = os.environ.get("CODEX_THREAD_ID", "").strip()
+    if current_session_id:
+        current_receipt = codex_token_contract.load_receipt(current_session_id)
+        if not current_receipt:
+            return _check(
+                "FAIL",
+                "Token contract host receipt",
+                f"no receipt for current session {current_session_id}",
+            )
+        if current_receipt.get("session_id") != current_session_id:
+            return _check("FAIL", "Token contract host receipt", "current-session receipt identity mismatch")
+        if not codex_token_contract.receipt_is_current(current_receipt):
+            return _check("FAIL", "Token contract host receipt", "current-session receipt version/hash mismatch")
+        if current_receipt.get("simulated") is not False:
+            return _check("FAIL", "Token contract host receipt", "current session has only a simulated receipt")
+        # The receipt is content-bound to the exact contract version/hash.
+        # Reinstalling identical content may advance install-state time, but it
+        # does not invalidate this host-delivered receipt.
+        return _check(
+            "OK",
+            "Token contract host receipt",
+            f"host-invoked receipt for current session {current_session_id}",
+        )
+
     current_refresh: dict[str, Any] | None = None
     for receipt in codex_token_contract.iter_receipts():
         last_seen_at = _parse_epoch(receipt.get("last_seen_at"))
@@ -310,9 +337,17 @@ def _token_contract_runtime_check() -> dict[str, str]:
                 current_refresh = {**receipt, "last_seen_epoch": last_seen_at}
 
     newest: dict[str, Any] | None = None
+    saw_post_install_subagent = False
     for path, _mtime, _project in codex_session.find_all_jsonl_files(days=30, max_files=500):
         identity = codex_session.session_identity(path)
         if not identity or identity["started_at"] < boundary:
+            continue
+        # Internal collaboration subagents do not receive the host-level
+        # SessionStart/UserPromptSubmit contract hooks. They therefore cannot
+        # produce a legitimate host receipt and must not displace the newest
+        # qualifying top-level session in this readiness check.
+        if identity.get("thread_source") == "subagent":
+            saw_post_install_subagent = True
             continue
         if newest is None or identity["started_at"] > newest["started_at"]:
             newest = identity
@@ -323,6 +358,12 @@ def _token_contract_runtime_check() -> dict[str, str]:
                 "OK",
                 "Token contract host receipt",
                 f"host-invoked active-chat refresh for session {current_refresh.get('session_id')}",
+            )
+        if saw_post_install_subagent:
+            return _check(
+                "FAIL",
+                "Token contract host receipt",
+                "only unhooked subagent sessions were found after contract installation",
             )
         return _check(
             "WARN",
