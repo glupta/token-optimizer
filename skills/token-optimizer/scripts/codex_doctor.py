@@ -281,6 +281,25 @@ def _token_contract_smoke_check() -> dict[str, str]:
     )
 
 
+def _proven_internal_collaboration_worker(session_id: str) -> tuple[bool, str | None]:
+    """Cross-check rollout metadata and Codex state for the current worker."""
+    path = codex_session.find_session_jsonl_by_id(session_id)
+    if path is None:
+        return False, None
+    identity = codex_session.session_identity(path)
+    if (
+        not identity
+        or identity.get("session_id") != session_id
+        or identity.get("thread_source") != "subagent"
+        or not isinstance(identity.get("parent_thread_id"), str)
+    ):
+        return False, None
+    parent_thread_id = identity["parent_thread_id"]
+    if not codex_state.is_active_internal_collaboration_worker(session_id, parent_thread_id):
+        return False, None
+    return True, parent_thread_id
+
+
 def _token_contract_runtime_check() -> dict[str, str]:
     state = codex_token_contract.load_install_state()
     installed_at = _parse_epoch(state.get("contract_installed_at"))
@@ -296,11 +315,20 @@ def _token_contract_runtime_check() -> dict[str, str]:
         )
 
     boundary = installed_at + HOST_SESSION_START_GRACE_SECONDS
-    # CODEX_THREAD_ID is trusted host metadata. If a host deliberately shares
-    # it with a child context, the exact version/hash-bound receipt represents
-    # that same delivered contract context rather than user-controlled input.
+    # CODEX_THREAD_ID selects the current context, but is insufficient proof by
+    # itself. Internal collaboration workers do not receive host contract hooks,
+    # so accept N/A only when immutable rollout metadata and Codex's read-only
+    # thread/spawn state independently agree on the same live parent-child edge.
     current_session_id = os.environ.get("CODEX_THREAD_ID", "").strip()
     if current_session_id:
+        internal_worker, parent_thread_id = _proven_internal_collaboration_worker(current_session_id)
+        if internal_worker:
+            return _check(
+                "OK",
+                "Token contract host receipt",
+                "not applicable for proven internal collaboration worker "
+                f"{current_session_id} (parent {parent_thread_id})",
+            )
         current_receipt = codex_token_contract.load_receipt(current_session_id)
         if not current_receipt:
             return _check(

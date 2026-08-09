@@ -30,6 +30,7 @@ intentionally out of scope.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -164,6 +165,75 @@ def _empty_subagents() -> dict[str, Any]:
         "by_parent": [],
         "leaked": [],
     }
+
+
+def is_active_internal_collaboration_worker(child_thread_id: str, parent_thread_id: str) -> bool:
+    """Prove a live internal worker from Codex-owned state, or fail closed.
+
+    This is intentionally narrower than merely finding a row in ``threads``.
+    The child must have an open spawn edge to the expected parent and the
+    independently stored thread source must describe the same collaboration
+    spawn at depth >= 1 under the internal ``/root`` agent tree. Missing tables,
+    schema drift, malformed JSON, closed edges, and any disagreement return
+    ``False``.
+    """
+    if not _is_codex() or not child_thread_id or not parent_thread_id:
+        return False
+    db = _find_versioned_db("state", "threads")
+    if db is None:
+        return False
+
+    try:
+        with _ro_connect(db) as conn:
+            thread_cols = _table_columns(conn, "threads")
+            edge_cols = _table_columns(conn, "thread_spawn_edges")
+            if not {"id", "source", "thread_source"} <= thread_cols:
+                return False
+            if not {"parent_thread_id", "child_thread_id", "status"} <= edge_cols:
+                return False
+            rows = conn.execute(
+                """
+                SELECT t.source AS source,
+                       t.thread_source AS thread_source,
+                       e.parent_thread_id AS parent_id,
+                       e.child_thread_id AS child_id,
+                       e.status AS edge_status
+                FROM threads t
+                JOIN thread_spawn_edges e ON e.child_thread_id = t.id
+                WHERE t.id = ? AND e.parent_thread_id = ?
+                LIMIT 2
+                """,
+                (child_thread_id, parent_thread_id),
+            ).fetchall()
+    except (sqlite3.Error, OSError):
+        return False
+
+    if len(rows) != 1:
+        return False
+    row = rows[0]
+    if (
+        str(row["child_id"] or "") != child_thread_id
+        or str(row["parent_id"] or "") != parent_thread_id
+        or str(row["edge_status"] or "").lower() != "open"
+        or str(row["thread_source"] or "").lower() != "subagent"
+    ):
+        return False
+    try:
+        source = json.loads(str(row["source"] or ""))
+        spawn = source["subagent"]["thread_spawn"]
+        source_parent = spawn["parent_thread_id"]
+        depth = spawn["depth"]
+        agent_path = spawn["agent_path"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return False
+    return bool(
+        source_parent == parent_thread_id
+        and isinstance(depth, int)
+        and not isinstance(depth, bool)
+        and depth >= 1
+        and isinstance(agent_path, str)
+        and agent_path.startswith("/root/")
+    )
 
 
 def subagent_costs() -> dict[str, Any]:

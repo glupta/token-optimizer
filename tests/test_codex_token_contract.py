@@ -2,6 +2,7 @@
 
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -15,6 +16,7 @@ sys.path.insert(0, str(SCRIPTS))
 import codex_doctor
 import codex_hook_bridge
 import codex_session
+import codex_state
 import codex_token_contract
 
 
@@ -178,6 +180,95 @@ class CodexTokenContractTests(unittest.TestCase):
             self.assertEqual(identity["session_id"], "session-immutable-123456")
             self.assertEqual(identity["started_at"], 1786190400.0)
             self.assertEqual(identity["thread_source"], "subagent")
+            self.assertIsNone(identity["parent_thread_id"])
+
+    def test_session_identity_requires_consistent_internal_spawn_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session.jsonl"
+            child = "session-child-123456"
+            parent = "session-parent-123456"
+            record = {
+                "timestamp": "2026-08-08T12:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": child,
+                    "parent_thread_id": parent,
+                    "thread_source": "subagent",
+                    "source": {
+                        "subagent": {
+                            "thread_spawn": {
+                                "parent_thread_id": parent,
+                                "depth": 1,
+                                "agent_path": "/root/worker",
+                            }
+                        }
+                    },
+                },
+            }
+            path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            self.assertEqual(codex_session.session_identity(path)["parent_thread_id"], parent)
+
+            record["payload"]["parent_thread_id"] = "session-spoof-123456"
+            path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            self.assertIsNone(codex_session.session_identity(path)["parent_thread_id"])
+
+    def test_state_proof_requires_matching_open_internal_edge_and_source(self):
+        child = "session-child-123456"
+        parent = "session-parent-123456"
+        source = json.dumps({
+            "subagent": {
+                "thread_spawn": {
+                    "parent_thread_id": parent,
+                    "depth": 1,
+                    "agent_path": "/root/worker",
+                }
+            }
+        })
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "state_1.sqlite"
+            conn = sqlite3.connect(db)
+            conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, source TEXT, thread_source TEXT)")
+            conn.execute(
+                "CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT PRIMARY KEY, status TEXT)"
+            )
+            conn.execute("INSERT INTO threads VALUES (?, ?, ?)", (child, source, "subagent"))
+            conn.execute("INSERT INTO thread_spawn_edges VALUES (?, ?, ?)", (parent, child, "open"))
+            conn.commit()
+            conn.close()
+
+            with patch.object(codex_state, "_is_codex", return_value=True), patch.object(
+                codex_state, "_find_versioned_db", return_value=db
+            ):
+                self.assertTrue(codex_state.is_active_internal_collaboration_worker(child, parent))
+
+                # Each single-surface spoof fails independently: closed edge,
+                # wrong thread classification, wrong source parent, or non-root
+                # agent path can never establish the N/A route.
+                mutations = [
+                    ("UPDATE thread_spawn_edges SET status = 'closed'", "UPDATE thread_spawn_edges SET status = 'open'"),
+                    ("UPDATE threads SET thread_source = 'cli'", "UPDATE threads SET thread_source = 'subagent'"),
+                    (
+                        "UPDATE threads SET source = '{\"subagent\":{\"thread_spawn\":{\"parent_thread_id\":\"wrong-parent\",\"depth\":1,\"agent_path\":\"/root/worker\"}}}'",
+                        "UPDATE threads SET source = ?",
+                    ),
+                    (
+                        "UPDATE threads SET source = '{\"subagent\":{\"thread_spawn\":{\"parent_thread_id\":\"session-parent-123456\",\"depth\":1,\"agent_path\":\"user-controlled\"}}}'",
+                        "UPDATE threads SET source = ?",
+                    ),
+                ]
+                for mutate, restore in mutations:
+                    conn = sqlite3.connect(db)
+                    conn.execute(mutate)
+                    conn.commit()
+                    conn.close()
+                    self.assertFalse(codex_state.is_active_internal_collaboration_worker(child, parent))
+                    conn = sqlite3.connect(db)
+                    if "?" in restore:
+                        conn.execute(restore, (source,))
+                    else:
+                        conn.execute(restore)
+                    conn.commit()
+                    conn.close()
 
     def test_session_start_injects_contract_for_every_source(self):
         for source in ("startup", "resume", "clear", "compact"):
@@ -418,6 +509,80 @@ class CodexTokenContractDoctorTests(unittest.TestCase):
 
             self.assertEqual(check["status"], "FAIL")
             find_sessions.assert_not_called()
+
+    def test_current_internal_worker_is_narrowly_not_applicable(self):
+        current_session_id = "session-child-123456"
+        parent_session_id = "session-parent-123456"
+        identity = {
+            "session_id": current_session_id,
+            "started_at": 1001,
+            "path": "worker.jsonl",
+            "thread_source": "subagent",
+            "parent_thread_id": parent_session_id,
+        }
+        with patch.dict(
+            os.environ, {"CODEX_THREAD_ID": current_session_id}
+        ), patch.object(
+            codex_token_contract, "load_install_state", side_effect=self._install_state
+        ), patch.object(
+            codex_session, "find_session_jsonl_by_id", return_value=Path("worker.jsonl")
+        ), patch.object(
+            codex_session, "session_identity", return_value=identity
+        ), patch.object(
+            codex_state, "is_active_internal_collaboration_worker", return_value=True
+        ) as state_proof, patch.object(
+            codex_token_contract, "load_receipt"
+        ) as load_receipt:
+            check = codex_doctor._token_contract_runtime_check()
+
+        self.assertEqual(check["status"], "OK")
+        self.assertIn("not applicable for proven internal collaboration worker", check["detail"])
+        self.assertIn(parent_session_id, check["detail"])
+        state_proof.assert_called_once_with(current_session_id, parent_session_id)
+        load_receipt.assert_not_called()
+
+    def test_current_thread_spoofs_do_not_bypass_host_receipt_failure(self):
+        current_session_id = "session-child-123456"
+        parent_session_id = "session-parent-123456"
+        cases = {
+            "environment only": (None, None, False),
+            "rollout only": (
+                Path("worker.jsonl"),
+                {
+                    "session_id": current_session_id,
+                    "thread_source": "subagent",
+                    "parent_thread_id": parent_session_id,
+                },
+                False,
+            ),
+            "mismatched rollout identity": (
+                Path("worker.jsonl"),
+                {
+                    "session_id": "different-child-123456",
+                    "thread_source": "subagent",
+                    "parent_thread_id": parent_session_id,
+                },
+                True,
+            ),
+        }
+        for name, (path, identity, state_result) in cases.items():
+            with self.subTest(name=name), patch.dict(
+                os.environ, {"CODEX_THREAD_ID": current_session_id}
+            ), patch.object(
+                codex_token_contract, "load_install_state", side_effect=self._install_state
+            ), patch.object(
+                codex_session, "find_session_jsonl_by_id", return_value=path
+            ), patch.object(
+                codex_session, "session_identity", return_value=identity
+            ), patch.object(
+                codex_state, "is_active_internal_collaboration_worker", return_value=state_result
+            ), patch.object(
+                codex_token_contract, "load_receipt", return_value={}
+            ):
+                check = codex_doctor._token_contract_runtime_check()
+
+            self.assertEqual(check["status"], "FAIL")
+            self.assertIn("no receipt for current session", check["detail"])
 
     def test_only_post_install_subagents_fail_closed_without_current_thread(self):
         boundary = 1000 + codex_doctor.HOST_SESSION_START_GRACE_SECONDS

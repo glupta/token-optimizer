@@ -275,6 +275,7 @@ def session_identity(path: Path, max_records: int = 256) -> dict[str, Any] | Non
     first_ts: datetime | None = None
     session_id: str | None = None
     thread_source: str | None = None
+    parent_thread_id: str | None = None
     for index, record in enumerate(_iter_json_records(path, skip_large_file=False)):
         if index >= max_records:
             break
@@ -292,6 +293,23 @@ def session_identity(path: Path, max_records: int = 256) -> dict[str, Any] | Non
                 payload["source"].get("subagent"), dict
             ):
                 thread_source = "subagent"
+            source = payload.get("source")
+            subagent = source.get("subagent") if isinstance(source, dict) else None
+            spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+            nested_parent = spawn.get("parent_thread_id") if isinstance(spawn, dict) else None
+            top_parent = payload.get("parent_thread_id")
+            depth = spawn.get("depth") if isinstance(spawn, dict) else None
+            if (
+                thread_source == "subagent"
+                and isinstance(nested_parent, str)
+                and isinstance(top_parent, str)
+                and _safe_session_id(nested_parent) == nested_parent
+                and top_parent == nested_parent
+                and isinstance(depth, int)
+                and not isinstance(depth, bool)
+                and depth >= 1
+            ):
+                parent_thread_id = nested_parent
             session_ts = _parse_ts(record.get("timestamp") or payload.get("timestamp"))
             first_ts = session_ts or first_ts
             break
@@ -302,6 +320,7 @@ def session_identity(path: Path, max_records: int = 256) -> dict[str, Any] | Non
         "started_at": first_ts.timestamp(),
         "path": str(path),
         "thread_source": thread_source,
+        "parent_thread_id": parent_thread_id,
     }
 
 
