@@ -7755,9 +7755,13 @@ def parse_session_turns(filepath):
         return turns
 
     turns = []
-    turn_index = 0
     tier = _load_pricing_tier()
-    prev_call_ts = None
+    # Streaming-aware dedup (mirrors _parse_session_jsonl v5.4.9 fix).
+    # Claude Code writes multiple assistant records per requestId during streaming;
+    # each record's usage.output_tokens is cumulative. We keep MAX token counts
+    # and union tools_used across all chunks for the same requestId so callers
+    # receive one turn per API call, not one turn per streaming record.
+    request_usage_map = {}  # key -> {inp, out, cr, cc, cc_1h, cc_5m, model, ts, tools}
 
     try:
         with open(filepath, "r", encoding="utf-8", errors="replace") as f:
@@ -7794,51 +7798,90 @@ def parse_session_turns(filepath):
                 )
                 cc = usage.get("cache_creation_input_tokens", 0) or (cc_1h + cc_5m)
                 model = msg.get("model", "unknown")
+                ts_str = record.get("timestamp")
 
-                # Extract tools used in this turn
-                tools = []
+                # Extract tools used in this record (union across streaming chunks)
+                tools_in_record = []
                 content = msg.get("content", [])
                 if isinstance(content, list):
                     for block in content:
                         if isinstance(block, dict) and block.get("type") == "tool_use":
-                            tools.append(block.get("name", ""))
+                            tools_in_record.append(block.get("name", ""))
 
-                ts_str = record.get("timestamp")
-                gap_since_prev_seconds = None
-                if ts_str:
-                    try:
-                        call_ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                        if prev_call_ts is not None:
-                            gap_since_prev_seconds = int(round(max(0, (call_ts - prev_call_ts).total_seconds())))
-                        prev_call_ts = call_ts
-                    except (ValueError, TypeError):
-                        pass
-                # Price cache-create by TTL tier when the per-turn split is available.
-                if cc_1h or cc_5m:
-                    cost = _get_model_cost(model, inp_tok, out_tok, cr, cc, tier=tier,
-                                           cache_create_1h=cc_1h, cache_create_5m=cc_5m)
+                req_id = record.get("requestId")
+                # Records without requestId must not collapse with each other.
+                key = req_id if req_id else f"__noreq__{len(request_usage_map)}"
+                prev = request_usage_map.get(key)
+                if prev is None:
+                    request_usage_map[key] = {
+                        "inp": inp_tok, "out": out_tok, "cr": cr, "cc": cc,
+                        "cc_1h": cc_1h, "cc_5m": cc_5m, "model": model,
+                        "ts": ts_str, "tools": list(tools_in_record),
+                    }
                 else:
-                    cost = _get_model_cost(model, inp_tok, out_tok, cr, cc, tier=tier)
-
-                turns.append({
-                    "turn_index": turn_index,
-                    "role": "assistant",
-                    "input_tokens": inp_tok,
-                    "output_tokens": out_tok,
-                    "cache_read": cr,
-                    "cache_creation": cc,
-                    "cache_creation_1h": cc_1h,
-                    "cache_creation_5m": cc_5m,
-                    "model": model,
-                    "timestamp": ts_str,
-                    "gap_since_prev_seconds": gap_since_prev_seconds,
-                    "tools_used": tools,
-                    "cost_usd": round(cost, 6),
-                })
-                turn_index += 1
+                    # Streaming: keep MAX token counts (cumulative fields grow monotonically).
+                    prev["inp"] = max(prev["inp"], inp_tok)
+                    prev["out"] = max(prev["out"], out_tok)
+                    prev["cr"] = max(prev["cr"], cr)
+                    prev["cc"] = max(prev["cc"], cc)
+                    prev["cc_1h"] = max(prev["cc_1h"], cc_1h)
+                    prev["cc_5m"] = max(prev["cc_5m"], cc_5m)
+                    if model and model != "unknown":
+                        prev["model"] = model
+                    if ts_str:
+                        prev["ts"] = ts_str
+                    for t in tools_in_record:
+                        if t not in prev["tools"]:
+                            prev["tools"].append(t)
 
     except (PermissionError, OSError):
         pass
+
+    # Build one turn per deduplicated API call.
+    prev_call_ts = None
+    for turn_index, u in enumerate(request_usage_map.values()):
+        inp_tok = u["inp"]
+        out_tok = u["out"]
+        cr = u["cr"]
+        cc = u["cc"]
+        cc_1h = u["cc_1h"]
+        cc_5m = u["cc_5m"]
+        model = u["model"]
+        ts_str = u["ts"]
+        tools = u["tools"]
+
+        gap_since_prev_seconds = None
+        if ts_str:
+            try:
+                call_ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                if prev_call_ts is not None:
+                    gap_since_prev_seconds = int(round(max(0, (call_ts - prev_call_ts).total_seconds())))
+                prev_call_ts = call_ts
+            except (ValueError, TypeError):
+                pass
+
+        # Price cache-create by TTL tier when the per-turn split is available.
+        if cc_1h or cc_5m:
+            cost = _get_model_cost(model, inp_tok, out_tok, cr, cc, tier=tier,
+                                   cache_create_1h=cc_1h, cache_create_5m=cc_5m)
+        else:
+            cost = _get_model_cost(model, inp_tok, out_tok, cr, cc, tier=tier)
+
+        turns.append({
+            "turn_index": turn_index,
+            "role": "assistant",
+            "input_tokens": inp_tok,
+            "output_tokens": out_tok,
+            "cache_read": cr,
+            "cache_creation": cc,
+            "cache_creation_1h": cc_1h,
+            "cache_creation_5m": cc_5m,
+            "model": model,
+            "timestamp": ts_str,
+            "gap_since_prev_seconds": gap_since_prev_seconds,
+            "tools_used": tools,
+            "cost_usd": round(cost, 6),
+        })
 
     return turns
 

@@ -13,6 +13,7 @@ from typing import Any
 import codex_compact_prompt
 import codex_io
 import codex_statusline
+import codex_token_contract
 from runtime_env import codex_home
 
 TOKEN_OPTIMIZER_MARKER = "token-optimizer/scripts"
@@ -348,6 +349,12 @@ def install(
         if enable_status_line:
             details["status_line"] = codex_statusline.install(force=force_status_line)
         codex_io.atomic_write_json(path, updated)
+        if is_global:
+            install_state = codex_token_contract.record_global_install()
+            details["token_contract"] = {
+                "version": codex_token_contract.CONTRACT_VERSION,
+                "install_state": str(install_state),
+            }
     return path, "installed", details
 
 

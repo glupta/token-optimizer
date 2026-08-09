@@ -15,8 +15,15 @@ def _write_atomic(filepath, content):
     """Atomic write via tmp + rename."""
     filepath = Path(filepath)
     tmp = filepath.with_suffix(f".{os.getpid()}.tmp")
-    tmp.write_text(content, encoding="utf-8")
-    os.replace(tmp, filepath)
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        os.replace(tmp, filepath)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 # Marker format: <!-- TOKEN_OPTIMIZER:SECTION_NAME --> ... <!-- /TOKEN_OPTIMIZER:SECTION_NAME -->
@@ -145,7 +152,7 @@ def check_staleness(filepath, section, max_age_hours=DEFAULT_MAX_AGE_HOURS):
         return {"stale": True, "age_hours": None, "exists": True}
 
     try:
-        block_time = datetime.fromisoformat(ts_match.group(1))
+        block_time = datetime.strptime(ts_match.group(1), "%Y-%m-%dT%H:%M")
         age_hours = (datetime.now() - block_time).total_seconds() / 3600
         return {
             "stale": age_hours > max_age_hours,

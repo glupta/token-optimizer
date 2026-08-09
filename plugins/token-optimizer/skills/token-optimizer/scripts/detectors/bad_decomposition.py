@@ -54,7 +54,7 @@ def detect_bad_decomposition(session_data):
                 if word_count < 800:
                     continue
 
-                imperative_matches = set(_IMPERATIVE_PATTERN.findall(text))
+                imperative_matches = {m.lower() for m in _IMPERATIVE_PATTERN.findall(text)}
                 if len(imperative_matches) >= 5:
                     monolith_count += 1
 

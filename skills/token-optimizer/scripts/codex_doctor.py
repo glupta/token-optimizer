@@ -7,12 +7,18 @@ import argparse
 import json
 import os
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from runtime_env import codex_home, detect_runtime, runtime_home
+import codex_session
 import codex_state
 import codex_statusline
+import codex_hook_bridge
+import codex_token_contract
+
+HOST_SESSION_START_GRACE_SECONDS = 1.0
 
 SUPPORTED_HOOK_EVENTS = {
     "PreToolUse",
@@ -31,6 +37,7 @@ REQUIRED_FILES = (
     "hooks/run.py",
     "skills/token-optimizer/scripts/codex_hook_bridge.py",
     "skills/token-optimizer/scripts/codex_session.py",
+    "skills/token-optimizer/scripts/codex_token_contract.py",
     "skills/token-optimizer/scripts/codex_compact_prompt.py",
     "skills/token-optimizer/scripts/codex_statusline.py",
     "skills/token-optimizer/scripts/codex_install.py",
@@ -47,6 +54,7 @@ SKILL_INSTALL_FILES = (
     "SKILL.md",
     "scripts/codex_hook_bridge.py",
     "scripts/codex_session.py",
+    "scripts/codex_token_contract.py",
     "scripts/codex_compact_prompt.py",
     "scripts/codex_statusline.py",
     "scripts/codex_install.py",
@@ -244,6 +252,103 @@ def _global_hook_check() -> dict[str, str]:
     return _check("WARN", "Global hooks", f"no Token Optimizer hooks in {hooks_path}; run measure.py codex-install")
 
 
+def _parse_epoch(value: Any) -> float | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except (ValueError, TypeError, OSError):
+        return None
+
+
+def _token_contract_smoke_check() -> dict[str, str]:
+    output = codex_hook_bridge.build_session_start_context("startup", None)
+    marker_count = output.count(codex_token_contract.CONTRACT_BEGIN)
+    try:
+        codex_token_contract.validate_contract_text(output)
+    except ValueError as exc:
+        return _check("FAIL", "Token contract adapter", str(exc))
+    if marker_count != 1 or codex_token_contract.CONTRACT_VERSION not in output:
+        return _check("FAIL", "Token contract adapter", "synthetic startup did not emit exactly one current contract")
+    return _check(
+        "OK",
+        "Token contract adapter",
+        f"{codex_token_contract.CONTRACT_VERSION} {codex_token_contract.CONTRACT_SHA256[:12]}; "
+        "SessionStart plus stale-session UserPromptSubmit refresh",
+    )
+
+
+def _token_contract_runtime_check() -> dict[str, str]:
+    state = codex_token_contract.load_install_state()
+    installed_at = _parse_epoch(state.get("contract_installed_at"))
+    if (
+        state.get("contract_version") != codex_token_contract.CONTRACT_VERSION
+        or state.get("contract_sha256") != codex_token_contract.CONTRACT_SHA256
+        or installed_at is None
+    ):
+        return _check(
+            "WARN",
+            "Token contract host receipt",
+            "global contract install state is missing or stale; rerun measure.py codex-install",
+        )
+
+    boundary = installed_at + HOST_SESSION_START_GRACE_SECONDS
+    current_refresh: dict[str, Any] | None = None
+    for receipt in codex_token_contract.iter_receipts():
+        last_seen_at = _parse_epoch(receipt.get("last_seen_at"))
+        if (
+            last_seen_at is not None
+            and last_seen_at >= installed_at
+            and receipt.get("simulated") is False
+            and codex_token_contract.receipt_is_current(receipt)
+            and "user-prompt-refresh" in receipt.get("sources", [])
+        ):
+            if current_refresh is None or last_seen_at > current_refresh["last_seen_epoch"]:
+                current_refresh = {**receipt, "last_seen_epoch": last_seen_at}
+
+    newest: dict[str, Any] | None = None
+    for path, _mtime, _project in codex_session.find_all_jsonl_files(days=30, max_files=500):
+        identity = codex_session.session_identity(path)
+        if not identity or identity["started_at"] < boundary:
+            continue
+        if newest is None or identity["started_at"] > newest["started_at"]:
+            newest = identity
+
+    if newest is None:
+        if current_refresh is not None:
+            return _check(
+                "OK",
+                "Token contract host receipt",
+                f"host-invoked active-chat refresh for session {current_refresh.get('session_id')}",
+            )
+        return _check(
+            "WARN",
+            "Token contract host receipt",
+            "installed; pending the first post-install SessionStart or active-chat prompt refresh",
+        )
+
+    session_id = newest["session_id"]
+    receipt = codex_token_contract.load_receipt(session_id)
+    if not receipt:
+        return _check(
+            "FAIL",
+            "Token contract host receipt",
+            f"no receipt for qualifying session {session_id}; hook was not invoked or receipt writing failed",
+        )
+    if receipt.get("session_id") != session_id:
+        return _check("FAIL", "Token contract host receipt", f"receipt identity mismatch for qualifying session {session_id}")
+    if receipt.get("contract_version") != codex_token_contract.CONTRACT_VERSION:
+        return _check("FAIL", "Token contract host receipt", f"stale contract receipt for qualifying session {session_id}")
+    if receipt.get("contract_sha256") != codex_token_contract.CONTRACT_SHA256:
+        return _check("FAIL", "Token contract host receipt", f"contract hash mismatch for qualifying session {session_id}")
+    if receipt.get("simulated") is not False:
+        return _check("FAIL", "Token contract host receipt", f"qualifying session {session_id} has only a simulated receipt")
+    return _check("OK", "Token contract host receipt", f"host-invoked receipt for session {session_id}")
+
+
 def _global_hook_config_checks() -> list[dict[str, str]]:
     hooks_path = codex_home() / "hooks.json"
     data, error = _load_json(hooks_path)
@@ -286,7 +391,11 @@ def _project_hook_check(project: Path) -> dict[str, str]:
     if not isinstance(data, dict) or not isinstance(data.get("hooks"), dict):
         return _check("FAIL", "Project hooks", f"{hooks_path} has no hooks object")
     if "token-optimizer/scripts" in json.dumps(data, sort_keys=True):
-        return _check("OK", "Project hooks", str(hooks_path))
+        return _check(
+            "FAIL",
+            "Project hooks",
+            f"duplicate Token Optimizer hooks in {hooks_path}; use the global user hook as the single authority",
+        )
     return _check("WARN", "Project hooks", f"no Token Optimizer hooks installed in {hooks_path}; manual refresh mode avoids visible Codex hook rows")
 
 
@@ -396,9 +505,11 @@ def run_checks(project: Path | None = None) -> list[dict[str, str]]:
     else:
         checks.extend(_skill_install_checks())
     checks.append(_compact_prompt_check())
+    checks.append(_token_contract_smoke_check())
     checks.append(_status_line_check())
     checks.append(_global_hook_check())
     checks.extend(_global_hook_config_checks())
+    checks.append(_token_contract_runtime_check())
     checks.append(_project_hook_check(project))
     checks.extend(_project_feature_checks(project))
     return checks

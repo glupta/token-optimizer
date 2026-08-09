@@ -51,7 +51,7 @@ def detect_wasteful_thinking(session_data):
                     continue
 
                 wasteful_turns += 1
-                total_wasted += thinking - output_tokens  # excess thinking
+                total_wasted += thinking - (4 * output_tokens)  # excess above 4x threshold
 
     except (OSError, PermissionError):
         return []

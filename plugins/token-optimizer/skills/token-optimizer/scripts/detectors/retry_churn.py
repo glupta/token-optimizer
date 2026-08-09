@@ -34,6 +34,8 @@ def detect_retry_churn(session_data):
                     text = content if isinstance(content, str) else str(content)[:500]
                     if "error" in text.lower() or "failed" in text.lower():
                         last_had_error = True
+                    else:
+                        last_had_error = False
                     continue
 
                 if rec_type != "assistant":
