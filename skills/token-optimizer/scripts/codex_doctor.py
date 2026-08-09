@@ -424,52 +424,86 @@ def _validate_hook_structure(data: dict[str, Any], source_path: Path) -> list[di
     return checks
 
 
+def _global_hooks_data() -> dict[str, Any]:
+    """Global user hooks, or {} when absent/malformed (they are optional)."""
+    data, error = _load_json(codex_home() / "hooks.json")
+    if error or not isinstance(data, dict) or not isinstance(data.get("hooks"), dict):
+        return {}
+    return data
+
+
+def _global_has_token_optimizer_hooks() -> bool:
+    return "token-optimizer/scripts" in json.dumps(_global_hooks_data(), sort_keys=True)
+
+
 def _project_hook_check(project: Path) -> dict[str, str]:
     hooks_path = project / ".codex" / "hooks.json"
+    global_installed = _global_has_token_optimizer_hooks()
     data, error = _load_json(hooks_path)
     if error:
+        if global_installed:
+            return _check("OK", "Project hooks", f"{hooks_path} not found; global user hook is the single authority")
         return _check("WARN", "Project hooks", f"{hooks_path} not found; per-project hooks are optional when global hooks are installed")
     if not isinstance(data, dict) or not isinstance(data.get("hooks"), dict):
         return _check("FAIL", "Project hooks", f"{hooks_path} has no hooks object")
     if "token-optimizer/scripts" in json.dumps(data, sort_keys=True):
-        return _check(
-            "FAIL",
-            "Project hooks",
-            f"duplicate Token Optimizer hooks in {hooks_path}; use the global user hook as the single authority",
-        )
+        if global_installed:
+            return _check(
+                "FAIL",
+                "Project hooks",
+                f"duplicate Token Optimizer hooks in {hooks_path}; use the global user hook as the single authority",
+            )
+        return _check("OK", "Project hooks", f"Token Optimizer hooks installed in {hooks_path}")
+    if global_installed:
+        return _check("OK", "Project hooks", f"none in {hooks_path}; global user hook is the single authority")
     return _check("WARN", "Project hooks", f"no Token Optimizer hooks installed in {hooks_path}; manual refresh mode avoids visible Codex hook rows")
 
 
 def _project_feature_checks(project: Path) -> list[dict[str, str]]:
     hooks_path = project / ".codex" / "hooks.json"
     data, error = _load_json(hooks_path)
-    if error or not isinstance(data, dict) or not isinstance(data.get("hooks"), dict):
+    project_hooks: dict[str, Any] = {}
+    if not error and isinstance(data, dict) and isinstance(data.get("hooks"), dict):
+        project_hooks = data.get("hooks", {})
+    global_hooks = _global_hooks_data().get("hooks", {})
+    if not project_hooks and not global_hooks:
         return []
 
-    hooks = data.get("hooks", {})
+    def _feature_scope(event: str, matcher: str | None, needles: tuple[str, ...]) -> str | None:
+        """Where the feature is wired: 'project', 'global', or None."""
+        for needle in needles:
+            if _has_project_hook(project_hooks, event, matcher, needle):
+                return "project"
+        for needle in needles:
+            if _has_project_hook(global_hooks, event, matcher, needle):
+                return "global"
+        return None
+
     checks = []
-    if _has_project_hook(hooks, "PreToolUse", "Bash", "bash_hook.py"):
+    if _feature_scope("PreToolUse", "Bash", ("bash_hook.py",)):
         checks.append(_check("OK", "Feature: Bash compression", "enabled for PreToolUse(Bash)"))
     else:
         checks.append(_check("OK", "Feature: Bash compression", "off by default to avoid visible Codex PreToolUse hook spam"))
 
     required_features = (
-        ("Session continuity and dashboard refresh", "Stop", None, "session-end-flush"),
+        ("Session continuity and dashboard refresh", "Stop", None, ("session-end-flush",)),
     )
     optional_noisy_features = (
-        ("Prompt quality nudges", "UserPromptSubmit", None, "codex_hook_bridge.py"),
-        ("Subagent sprawl tracking", "SubagentStart", None, "subagent-start"),
-        ("Tool output archive", "PostToolUse", "Bash", "archive_result.py"),
-        ("Context intelligence", "PostToolUse", "Bash", "context_intel.py"),
+        ("Prompt quality nudges", "UserPromptSubmit", None, ("codex_hook_bridge.py",)),
+        ("Subagent sprawl tracking", "SubagentStart", None, ("subagent-start",)),
+        ("Tool output archive", "PostToolUse", "Bash", ("archive_result.py", "codex_post_tool.py")),
+        ("Context intelligence", "PostToolUse", "Bash", ("context_intel.py", "codex_post_tool.py")),
     )
-    for feature, event, matcher, needle in required_features:
-        if _has_project_hook(hooks, event, matcher, needle):
-            checks.append(_check("OK", f"Feature: {feature}", "available in current Codex adapter"))
+    for feature, event, matcher, needles in required_features:
+        scope = _feature_scope(event, matcher, needles)
+        if scope:
+            checks.append(_check("OK", f"Feature: {feature}", f"available in current Codex adapter ({scope} hooks)"))
         else:
             checks.append(_check("WARN", f"Feature: {feature}", f"manual refresh mode; install low-noise Stop hook with measure.py codex-install --project {project}"))
-    for feature, event, matcher, needle in optional_noisy_features:
-        if _has_project_hook(hooks, event, matcher, needle):
-            checks.append(_check("OK", f"Optional feature: {feature}", "enabled; Codex Desktop will show visible hook rows"))
+    for feature, event, matcher, needles in optional_noisy_features:
+        scope = _feature_scope(event, matcher, needles)
+        if scope:
+            checks.append(_check("OK", f"Optional feature: {feature}", f"enabled via {scope} hooks; Codex Desktop will show visible hook rows"))
         else:
             checks.append(_check("OK", f"Optional feature: {feature}", "off by default to avoid visible Codex hook rows"))
 
