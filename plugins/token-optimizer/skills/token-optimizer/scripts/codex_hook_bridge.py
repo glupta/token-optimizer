@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import codex_session
+import codex_token_contract
 import measure
 from hook_io import read_stdin_hook_input
 
@@ -96,29 +97,42 @@ def _has_matching_checkpoint(session_id: str | None) -> bool:
     return False
 
 
-def handle_session_start() -> None:
-    hook_input = read_stdin_hook_input()
-    session_id = hook_input.get("session_id")
-    source = str(hook_input.get("source", "")).strip().lower()
-
-    # Keep existing self-healing behavior even when no context is injected.
-    _capture_stdout(measure.run_ensure_health)
-
+def build_session_start_context(source: str, session_id: str | None) -> str:
+    """Compose the adapter output for any Codex SessionStart source."""
     if source == "resume" and _has_matching_checkpoint(session_id):
-        context = _capture_stdout(
+        continuity_context = _capture_stdout(
             measure.compact_restore,
             session_id=session_id,
             is_compact=True,
         )
     elif source == "clear":
-        context = _capture_stdout(
+        continuity_context = _capture_stdout(
             measure.compact_restore,
             session_id=session_id,
             new_session_only=True,
         )
     else:
-        context = ""
+        continuity_context = ""
 
+    # SessionStart fires for startup, resume, clear, and compact. Always inject
+    # the fixed contract so fresh and post-compaction contexts share the same
+    # operating boundary. Any stale sentinel block in restored text is replaced.
+    return codex_token_contract.compose_session_context(continuity_context)
+
+
+def handle_session_start() -> None:
+    hook_input = read_stdin_hook_input()
+    session_id = hook_input.get("session_id")
+    source = str(hook_input.get("source", "")).strip().lower()
+
+    # Keep existing self-healing behavior even when no continuity is restored.
+    _capture_stdout(measure.run_ensure_health)
+
+    context = build_session_start_context(source, session_id)
+    try:
+        codex_token_contract.record_session_start_receipt(hook_input)
+    except Exception as exc:
+        print(f"[Token Optimizer] SessionStart receipt failed: {exc}", file=sys.stderr)
     _emit_additional_context("SessionStart", context)
 
 
@@ -128,12 +142,27 @@ def handle_user_prompt_submit() -> None:
     if transcript_path and not codex_session.is_codex_session_path(transcript_path):
         transcript_path = None
     session_id = hook_input.get("session_id")
+    refresh_context = ""
+    if codex_token_contract.needs_contract_refresh(session_id):
+        # Existing chats do not receive another SessionStart merely because a
+        # policy was installed. Refresh them once, on their next supported
+        # UserPromptSubmit boundary, and record the exact v2 delivery.
+        refresh_context = codex_token_contract.CONTRACT_TEXT
+        try:
+            codex_token_contract.record_contract_receipt(
+                hook_input,
+                source="user-prompt-refresh",
+            )
+        except Exception as exc:
+            print(f"[Token Optimizer] active-session refresh receipt failed: {exc}", file=sys.stderr)
     raw_output = _capture_stdout(
         measure.quality_cache,
         quiet=True,
         session_jsonl=transcript_path,
     )
-    additional_context = _collect_system_messages(raw_output)
+    additional_context = "\n\n".join(
+        part for part in (refresh_context, _collect_system_messages(raw_output)) if part
+    )
     prompt_text = _extract_prompt_text(hook_input)
     cwd = hook_input.get("cwd")
     if not cwd and transcript_path:

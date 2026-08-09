@@ -270,6 +270,32 @@ def _session_meta_id(path: Path) -> str | None:
     return None
 
 
+def session_identity(path: Path, max_records: int = 256) -> dict[str, Any] | None:
+    """Return immutable session id/start time without parsing the full transcript."""
+    first_ts: datetime | None = None
+    session_id: str | None = None
+    for index, record in enumerate(_iter_json_records(path, skip_large_file=False)):
+        if index >= max_records:
+            break
+        payload = _payload(record)
+        timestamp = _parse_ts(record.get("timestamp") or payload.get("timestamp"))
+        if timestamp and first_ts is None:
+            first_ts = timestamp
+        if record.get("type") == "session_meta":
+            value = payload.get("id")
+            session_id = _safe_session_id(str(value)) if value else None
+            session_ts = _parse_ts(record.get("timestamp") or payload.get("timestamp"))
+            first_ts = session_ts or first_ts
+            break
+    if not session_id or first_ts is None:
+        return None
+    return {
+        "session_id": session_id,
+        "started_at": first_ts.timestamp(),
+        "path": str(path),
+    }
+
+
 def _project_name_from_file(path: Path) -> str:
     for record in _iter_json_records(path, skip_large_file=False):
         if record.get("type") != "session_meta":
