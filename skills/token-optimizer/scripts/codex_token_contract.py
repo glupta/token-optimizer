@@ -6,14 +6,22 @@ import hashlib
 import json
 import os
 import re
+import stat
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import codex_io
 from runtime_env import codex_home
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows only
+    fcntl = None
+    import msvcrt
 
 CONTRACT_VERSION = "studio-token-management-v2"
 CONTRACT_BEGIN = "<!-- STUDIO_TOKEN_MANAGEMENT:BEGIN -->"
@@ -146,6 +154,7 @@ RECEIPT_SCHEMA_VERSION = 1
 INSTALL_SCHEMA_VERSION = 1
 RECEIPT_RETENTION_DAYS = 14
 MAX_RECEIPT_SOURCES = 8
+REFRESH_FAILURE_BACKOFF_SECONDS = 60
 SIMULATED_ENV = "TOKEN_OPTIMIZER_SIMULATED"
 STATE_DIR_NAME = "token-optimizer"
 RECEIPT_DIR_NAME = "session-start-receipts"
@@ -186,6 +195,54 @@ def receipt_path(session_id: str, home: Path | None = None) -> Path:
     safe = _SAFE_ID_RE.sub("-", raw).strip("-")[:96] or "unknown"
     digest = hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:12]
     return receipt_dir(home) / f"{safe}-{digest}.json"
+
+
+def _receipt_lock_path(session_id: str, home: Path | None = None) -> Path:
+    return receipt_path(session_id, home).with_suffix(".lock")
+
+
+def _refresh_backoff_path(session_id: str, home: Path | None = None) -> Path:
+    receipt = receipt_path(session_id, home)
+    return state_dir(home) / "refresh-backoff" / receipt.name
+
+
+def _lock_descriptor(descriptor: int) -> None:
+    if fcntl is not None:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        return
+    os.ftruncate(descriptor, 1)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    msvcrt.locking(descriptor, msvcrt.LK_LOCK, 1)
+
+
+def _unlock_descriptor(descriptor: int) -> None:
+    if fcntl is not None:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        return
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+
+
+@contextmanager
+def _receipt_lock(session_id: str, home: Path | None = None):
+    path = _receipt_lock_path(session_id, home)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise ValueError(f"{path} must not be a symlink")
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    locked = False
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError(f"{path} must be a regular file")
+        os.fchmod(descriptor, 0o600)
+        _lock_descriptor(descriptor)
+        locked = True
+        yield
+    finally:
+        if locked:
+            _unlock_descriptor(descriptor)
+        os.close(descriptor)
 
 
 def _utc_iso(epoch: float) -> str:
@@ -241,6 +298,28 @@ def record_contract_receipt(
         return None
 
     timestamp = time.time() if now is None else now
+    with _receipt_lock(session_id, home):
+        path = _record_contract_receipt_locked(
+            hook_input,
+            source=source,
+            home=home,
+            now=timestamp,
+        )
+    prune_receipts(home=home, now=timestamp)
+    return path
+
+
+def _record_contract_receipt_locked(
+    hook_input: dict[str, Any],
+    *,
+    source: str | None = None,
+    home: Path | None = None,
+    now: float,
+) -> Path:
+    """Update one validated receipt while its per-session lock is held."""
+    session_id = str(hook_input["session_id"])
+    transcript_path = str(hook_input["transcript_path"])
+    timestamp = now
     path = receipt_path(session_id, home)
     existing = _load_object(path)
     sources = existing.get("sources")
@@ -264,8 +343,68 @@ def record_contract_receipt(
         "simulated": _is_truthy_env(SIMULATED_ENV),
     }
     codex_io.atomic_write_json(path, payload)
-    prune_receipts(home=home, now=timestamp)
     return path
+
+
+def refresh_contract_receipt(
+    hook_input: dict[str, Any],
+    *,
+    source: str = "user-prompt-refresh",
+    home: Path | None = None,
+    now: float | None = None,
+    recorder: Callable[..., Path] | None = None,
+) -> str:
+    """Single-flight a stale refresh and durably back off a failed provider."""
+    session_id = hook_input.get("session_id")
+    transcript_path = hook_input.get("transcript_path")
+    if not isinstance(session_id, str) or not session_id.strip():
+        return "invalid"
+    if not isinstance(transcript_path, str) or not transcript_path.strip():
+        return "invalid"
+
+    import codex_session
+
+    if not codex_session.is_codex_session_path(transcript_path):
+        return "invalid"
+
+    timestamp = time.time() if now is None else now
+    write_receipt = recorder or _record_contract_receipt_locked
+    backoff_path = _refresh_backoff_path(session_id, home)
+    with _receipt_lock(session_id, home):
+        existing = _load_object(receipt_path(session_id, home))
+        if existing.get("simulated") is not True and receipt_is_current(existing):
+            return "current"
+        backoff = _load_object(backoff_path)
+        failed_at = backoff.get("failed_at")
+        if (
+            isinstance(failed_at, (int, float))
+            and not isinstance(failed_at, bool)
+            and 0 <= timestamp - float(failed_at) < REFRESH_FAILURE_BACKOFF_SECONDS
+        ):
+            return "backoff"
+        try:
+            write_receipt(
+                hook_input,
+                source=source,
+                home=home,
+                now=timestamp,
+            )
+        except Exception:
+            codex_io.atomic_write_json(
+                backoff_path,
+                {
+                    "schema_version": 1,
+                    "contract_sha256": CONTRACT_SHA256,
+                    "failed_at": timestamp,
+                },
+            )
+            raise
+        try:
+            backoff_path.unlink()
+        except FileNotFoundError:
+            pass
+    prune_receipts(home=home, now=timestamp)
+    return "refreshed"
 
 
 def record_session_start_receipt(

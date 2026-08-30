@@ -5,6 +5,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -135,6 +136,181 @@ class CodexTokenContractTests(unittest.TestCase):
             },
         ):
             self.assertTrue(codex_token_contract.needs_contract_refresh("session-123456"))
+
+    def test_concurrent_real_path_receipt_updates_preserve_every_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            transcript = home / "sessions" / "2026" / "session.jsonl"
+            transcript.parent.mkdir(parents=True)
+            transcript.write_text("{}\n", encoding="utf-8")
+            barrier = threading.Barrier(2)
+
+            errors = []
+
+            def update(source):
+                try:
+                    barrier.wait(timeout=2)
+                    codex_token_contract.record_contract_receipt(
+                        {
+                            "session_id": "session-race",
+                            "transcript_path": str(transcript),
+                        },
+                        source=source,
+                        home=home,
+                        now=1000,
+                    )
+                except BaseException as exc:  # surfaced after both threads join
+                    errors.append(exc)
+
+            with patch.object(
+                codex_session, "is_codex_session_path", return_value=True
+            ):
+                threads = [
+                    threading.Thread(target=update, args=(source,))
+                    for source in ("consumer-a", "consumer-b")
+                ]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=3)
+
+            self.assertFalse(any(thread.is_alive() for thread in threads))
+            self.assertFalse(errors)
+            receipt = codex_token_contract.load_receipt("session-race", home)
+            self.assertEqual(set(receipt["sources"]), {"consumer-a", "consumer-b"})
+
+    def test_concurrent_stale_refresh_is_single_flight(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            transcript = home / "sessions" / "2026" / "session.jsonl"
+            transcript.parent.mkdir(parents=True)
+            transcript.write_text("{}\n", encoding="utf-8")
+            hook_input = {
+                "session_id": "session-herd",
+                "transcript_path": str(transcript),
+            }
+            entered = threading.Barrier(8)
+            recorder_calls = []
+            results = []
+            errors = []
+
+            def recorder(*args, **kwargs):
+                recorder_calls.append(1)
+                return codex_token_contract._record_contract_receipt_locked(
+                    *args, **kwargs
+                )
+
+            def refresh():
+                try:
+                    entered.wait(timeout=2)
+                    results.append(
+                        codex_token_contract.refresh_contract_receipt(
+                            hook_input,
+                            source="user-prompt-refresh",
+                            home=home,
+                            now=1000,
+                            recorder=recorder,
+                        )
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            with patch.object(
+                codex_session, "is_codex_session_path", return_value=True
+            ):
+                threads = [threading.Thread(target=refresh) for _ in range(8)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=3)
+
+            self.assertFalse(any(thread.is_alive() for thread in threads))
+            self.assertFalse(errors)
+            self.assertEqual(len(recorder_calls), 1)
+            self.assertEqual(results.count("refreshed"), 1)
+            self.assertEqual(results.count("current"), 7)
+            self.assertTrue(
+                codex_token_contract.receipt_is_current(
+                    codex_token_contract.load_receipt("session-herd", home)
+                )
+            )
+
+    def test_receipt_lock_rejects_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            lock_path = codex_token_contract._receipt_lock_path("session-link", home)
+            lock_path.parent.mkdir(parents=True)
+            target = home / "unrelated-state"
+            target.write_text("preserve", encoding="utf-8")
+            lock_path.symlink_to(target)
+
+            with patch.object(
+                codex_session, "is_codex_session_path", return_value=True
+            ), self.assertRaises(ValueError):
+                codex_token_contract.record_contract_receipt(
+                    {
+                        "session_id": "session-link",
+                        "transcript_path": str(home / "session.jsonl"),
+                    },
+                    home=home,
+                    now=1000,
+                )
+            self.assertEqual(target.read_text(encoding="utf-8"), "preserve")
+
+    def test_refresh_failure_backoff_is_durable_and_retries_after_boundary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            transcript = home / "sessions" / "2026" / "session.jsonl"
+            transcript.parent.mkdir(parents=True)
+            transcript.write_text("{}\n", encoding="utf-8")
+            hook_input = {
+                "session_id": "session-backoff",
+                "transcript_path": str(transcript),
+            }
+            calls = []
+
+            def failing(*_args, **_kwargs):
+                calls.append("failure")
+                raise OSError("fixture provider unavailable")
+
+            def succeeding(*args, **kwargs):
+                calls.append("success")
+                return codex_token_contract._record_contract_receipt_locked(
+                    *args, **kwargs
+                )
+
+            with patch.object(
+                codex_session, "is_codex_session_path", return_value=True
+            ):
+                with self.assertRaises(OSError):
+                    codex_token_contract.refresh_contract_receipt(
+                        hook_input, home=home, now=1000, recorder=failing
+                    )
+                backoff_path = codex_token_contract._refresh_backoff_path(
+                    "session-backoff", home
+                )
+                self.assertEqual(
+                    json.loads(backoff_path.read_text(encoding="utf-8"))["failed_at"],
+                    1000,
+                )
+                self.assertEqual(
+                    codex_token_contract.refresh_contract_receipt(
+                        hook_input, home=home, now=1001, recorder=succeeding
+                    ),
+                    "backoff",
+                )
+                self.assertEqual(calls, ["failure"])
+                self.assertEqual(
+                    codex_token_contract.refresh_contract_receipt(
+                        hook_input,
+                        home=home,
+                        now=1000 + codex_token_contract.REFRESH_FAILURE_BACKOFF_SECONDS,
+                        recorder=succeeding,
+                    ),
+                    "refreshed",
+                )
+            self.assertEqual(calls, ["failure", "success"])
+            self.assertFalse(backoff_path.exists())
 
     def test_receipt_rejects_transcript_outside_codex_session_roots(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -324,7 +500,7 @@ class CodexTokenContractTests(unittest.TestCase):
         ), patch.object(
             codex_hook_bridge.codex_token_contract, "needs_contract_refresh", side_effect=[True, False]
         ), patch.object(
-            codex_hook_bridge.codex_token_contract, "record_contract_receipt"
+            codex_hook_bridge.codex_token_contract, "refresh_contract_receipt"
         ) as record, patch.object(
             codex_hook_bridge,
             "_emit_additional_context",

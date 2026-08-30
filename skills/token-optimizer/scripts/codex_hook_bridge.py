@@ -149,7 +149,7 @@ def handle_user_prompt_submit() -> None:
         # UserPromptSubmit boundary, and record the exact v2 delivery.
         refresh_context = codex_token_contract.CONTRACT_TEXT
         try:
-            codex_token_contract.record_contract_receipt(
+            codex_token_contract.refresh_contract_receipt(
                 hook_input,
                 source="user-prompt-refresh",
             )
