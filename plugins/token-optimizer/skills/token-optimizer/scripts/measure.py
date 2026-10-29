@@ -25374,9 +25374,14 @@ def checkpoint_trigger(milestone=None, session_id=None, transcript_path=None, qu
         )
 
     filepath = None
-    if transcript_path and codex_session.is_codex_session_path(transcript_path):
+    if transcript_path:
+        # Honor the transcript the hook names (Claude or Codex) before searching
+        # ~/.claude/projects, which can pick a different session's newest file.
         candidate = Path(transcript_path)
-        if candidate.exists():
+        if candidate.is_file() and (
+            candidate.suffix == ".jsonl"
+            or codex_session.is_codex_session_path(transcript_path)
+        ):
             filepath = candidate
     if filepath is None and session_id:
         filepath = _find_session_jsonl_by_id(session_id)
